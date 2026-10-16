@@ -97,7 +97,7 @@ function parsePgUrl(raw) {
 function pgOpen(cfg) {
   return new Promise((resolve, reject) => {
     const sock = cfg.ssl
-      ? tls.connect({ host: cfg.host, port: cfg.port, rejectUnauthorized: false })
+      ? tls.connect({ host: cfg.host, port: cfg.port, servername: cfg.host, ALPNProtocols: ['http/1.1'], rejectUnauthorized: false })
       : net.connect({ host: cfg.host, port: cfg.port });
     let buf = Buffer.alloc(0);
     const queue = [];
@@ -1058,7 +1058,25 @@ function main() {
         try {
           const j = JSON.parse(t.toString('utf8'));
           if (!j || !j.host || !j.port) throw new Error('要 host/port');
-          target = { host: String(j.host), port: Number(j.port) };
+          target = { host: String(j.host), port: Number(j.port), proto: j.proto === 'udp' ? 'udp' : 'tcp' };
+          if (target.proto === 'udp') {
+            // UDP 中继：**一帧 = 一个数据报**（保留边界），双向直通
+            const dg = require('node:dgram').createSocket('udp4');
+            dg.on('message', (msg) => toClient(msg));
+            dg.on('error', (e) => {
+              toClient(Buffer.from(JSON.stringify({ ok: false, error: String(e.code || e.message) })), 1);
+              toClient(Buffer.alloc(0), 0x8);
+              try { socket.end(); } catch { /* 已关 */ }
+            });
+            dg.bind(0, () => {
+              console.log('[proxy] → udp://' + target.host + ':' + target.port);
+              toClient(Buffer.from(JSON.stringify({ ok: true, proto: 'udp', to: target.host + ':' + target.port })), 1);
+              for (const q of queue) dg.send(q, target.port, target.host, () => {});
+              queue = [];
+            });
+            upstream = dg;
+            return;
+          }
           upstream = net.connect({ host: target.host, port: target.port });
           upstream.on('connect', () => {
             console.log('[proxy] → ' + target.host + ':' + target.port);
@@ -1078,14 +1096,24 @@ function main() {
           try { socket.end(); } catch { /* 已关 */ }
         }
       },
-      (b) => { if (upstream && upstream.writable) upstream.write(b); else queue.push(b); },
+      (b) => {
+        if (!upstream) { queue.push(b); return; }
+        if (target && target.proto === 'udp') upstream.send(b, target.port, target.host, () => {});
+        else if (upstream.writable) upstream.write(b);
+        else queue.push(b);
+      },
       () => { try { socket.end(); } catch { /* 已关 */ } if (upstream) upstream.destroy(); },
       (p) => { try { socket.write(wsEncode(p, 0xa)); } catch { /* 已关 */ } }
     );
     socket.on('data', (c) => parse(c));
     if (head && head.length) parse(head);
-    socket.on('error', () => { if (upstream) upstream.destroy(); });
-    socket.on('close', () => { if (upstream) upstream.destroy(); });
+    // UDP 用 dgram.close()，TCP 用 destroy() —— 分开收尾
+    const closeUpstream = () => {
+      if (!upstream) return;
+      try { if (target && target.proto === 'udp') upstream.close(); else upstream.destroy(); } catch { /* 已关 */ }
+    };
+    socket.on('error', closeUpstream);
+    socket.on('close', closeUpstream);
   });
 
   server.listen(PORT, () => {
