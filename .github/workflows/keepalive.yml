@@ -13,5 +13,12 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - name: ping healthz
+        # 域名不写死：仓库变量 FREE_MAX_URL（gh variable set FREE_MAX_URL --body https://xxx.onrender.com）
+        # 好处是换区/换服务名不用改文件、不会把旧域名留在历史里。
         run: |
-          curl -fsS --max-time 25 --retry 2 "https://REPLACE-ME.onrender.com/healthz" | head -c 400
+          URL="${{ vars.FREE_MAX_URL }}"
+          if [ -z "$URL" ]; then
+            echo "仓库变量 FREE_MAX_URL 未设置（Settings → Secrets and variables → Actions → Variables）"
+            exit 1
+          fi
+          curl -fsS --max-time 25 --retry 2 "$URL/healthz" | head -c 400
