@@ -770,15 +770,22 @@ function main() {
             podIPv4: Object.values(os.networkInterfaces()).flat().filter((i) => i && i.family === 'IPv4' && !i.internal).map((i) => i.address),
             uptimeSec: Math.round(process.uptime()),
           };
-          // 监听端口：直接读 /proc/net/tcp（容器里没有 ss/netstat）
+          // 监听端口：直接读 /proc/net/tcp 与 /proc/net/tcp6（容器里没有 ss/netstat）。
+          // Node 绑 ::（IPv6）时监听项只出现在 tcp6 —— 只读 tcp 会得到空列表（实测踩过）。
           try {
-            const decode = (hex) => parseInt(hex, 16);
-            const lines = String(fs.readFileSync('/proc/net/tcp', 'utf8')).trim().split('\n').slice(1);
-            out.listenSockets = lines
-              .map((l) => l.trim().split(/\s+/))
-              .filter((f) => f[3] === '0A')
-              .map((f) => ({ port: decode(f[1].split(':')[1]), addr: f[1].split(':')[0] }));
-          } catch (e) { out.listenSockets = null; out.listenSocketsError = String((e && e.message) || e); }
+            const readListen = (file, family) => {
+              const txt = String(fs.readFileSync(file, 'utf8')).trim().split('\n').slice(1);
+              return txt
+                .map((l) => l.trim().split(/\s+/))
+                .filter((f) => f[3] === '0A')
+                .map((f) => ({ family, addr: f[1].split(':')[0], port: parseInt(f[1].split(':')[1], 16) }));
+            };
+            out.listenSockets = [...readListen('/proc/net/tcp', 'v4'), ...readListen('/proc/net/tcp6', 'v6')];
+            out.listenSocketsError = null;
+          } catch (e) {
+            out.listenSockets = null;
+            out.listenSocketsError = String((e && e.message) || e);
+          }
           // 出口 IP：Postgres 眼中的对端地址 = 本服务的出口 IP（共享网段）；顺带拿服务端地址
           if (PG_URL) {
             try {
