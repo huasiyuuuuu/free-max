@@ -753,6 +753,11 @@ function main() {
         });
       }
 
+      // 异步端点的兜底：把 rejection 变成 500。**必须在任何用到它的分支之前声明** ——
+      // 实测教训：声明在使用之后 → 请求处理器抛 `Cannot access 'guard' before initialization`
+      // （TDZ ReferenceError），未捕获异常直接**把整个实例搞退出**，而健康检查打 /healthz 查不出来。
+      const guard = (p) => p.catch((e) => json(res, 500, { error: String((e && e.message) || e) }));
+
       // ---- 网络身份自报：出口 IP / 监听端口 / 主机名（免费档没有 Dashboard Shell，这是替代品）----
       // 全部只读、只查本文件写死的语句、不向任何第三方站点发请求。
       if (url.pathname === '/admin/net') {
@@ -790,7 +795,6 @@ function main() {
 
       // ---- 持久化端点：Postgres（重启后仍在）/ Key Value（缓存、队列）----
       // 只走本文件里写死的语句，不接受任意 SQL；值做单引号转义与长度上限。
-      const guard = (p) => p.catch((e) => json(res, 500, { error: String((e && e.message) || e) }));
 
       if (url.pathname === '/admin/deps') {
         return guard((async () => {
