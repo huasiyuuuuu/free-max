@@ -392,6 +392,63 @@ function kvCommand(args, timeoutMs = 8000) {
   });
 }
 
+// ============================ WebSocket（零依赖，服务端）============================
+// 用途：把本该"从本机出去"的流量改从 Render 节点出去（出口 IP 换成 Render 的共享 NAT），
+// 以及反向：让本机借节点的 443 入站口做隧道。只做最必要的帧处理。
+const WS_GUID = '258EAFA5-E914-47DA-95CA-C5AB0DC85B11';
+function wsAccept(key) { return crypto.createHash('sha1').update(key + WS_GUID).digest('base64'); }
+
+function wsEncode(payload, opcode = 2) {
+  const len = payload.length;
+  let header;
+  if (len < 126) { header = Buffer.from([0x80 | opcode, len]); }
+  else if (len < 65536) { header = Buffer.alloc(4); header[0] = 0x80 | opcode; header[1] = 126; header.writeUInt16BE(len, 2); }
+  else { header = Buffer.alloc(10); header[0] = 0x80 | opcode; header[1] = 127; header.writeBigUInt64BE(BigInt(len), 2); }
+  return Buffer.concat([header, payload]);
+}
+
+// 增量帧解析：返回一个喂数据的函数
+function makeWsParser(onText, onBinary, onClose, onPing) {
+  let buf = Buffer.alloc(0);
+  let frags = [];
+  let fragOp = 0;
+  return (chunk) => {
+    buf = Buffer.concat([buf, chunk]);
+    for (;;) {
+      if (buf.length < 2) return;
+      const b0 = buf[0];
+      const b1 = buf[1];
+      const fin = (b0 & 0x80) !== 0;
+      const opcode = b0 & 0x0f;
+      const masked = (b1 & 0x80) !== 0;
+      let len = b1 & 0x7f;
+      let off = 2;
+      if (len === 126) { if (buf.length < 4) return; len = buf.readUInt16BE(2); off = 4; }
+      else if (len === 127) { if (buf.length < 10) return; len = Number(buf.readBigUInt64BE(2)); off = 10; }
+      let mask = null;
+      if (masked) { if (buf.length < off + 4) return; mask = buf.subarray(off, off + 4); off += 4; }
+      if (buf.length < off + len) return;
+      let payload = buf.subarray(off, off + len);
+      if (mask) {
+        const p = Buffer.allocUnsafe(len);
+        for (let i = 0; i < len; i++) p[i] = payload[i] ^ mask[i & 3];
+        payload = p;
+      }
+      buf = buf.subarray(off + len);
+      if (opcode === 0x8) { onClose(); return; }
+      if (opcode === 0x9) { if (onPing) onPing(payload); continue; }
+      if (opcode === 0xa) continue;                       // pong
+      if (opcode === 0x0) {                               // 续帧
+        frags.push(payload);
+        if (fin) { const whole = Buffer.concat(frags); frags = []; if (fragOp === 1) onText(whole); else onBinary(whole); }
+        continue;
+      }
+      if (!fin) { frags = [payload]; fragOp = opcode; continue; }
+      if (opcode === 1) onText(payload); else onBinary(payload);
+    }
+  };
+}
+
 // ============================ 主进程 ============================
 if (isMainThread) main();
 
@@ -800,6 +857,40 @@ function main() {
         })());
       }
 
+      // ---- 出网端口矩阵 + 出口 IP：回答「这个节点能当什么用」----
+      // open=TCP 握手成功（这一跳被放行）；refused=网络可达但对面没监听；timeout=大概率被平台过滤。
+      if (url.pathname === '/admin/probe') {
+        return guard((async () => {
+          const host = url.searchParams.get('host') || 'portquiz.net';
+          const ports = (url.searchParams.get('ports') || '22,25,53,80,110,143,443,465,587,993,1080,3128,3306,5432,6379,8080,8443,9000,10000,27017')
+            .split(',').map((x) => Number(x.trim())).filter((n) => n > 0 && n < 65536);
+          const timeout = Math.min(15000, Number(url.searchParams.get('timeout') || 5000));
+          const matrix = await Promise.all(ports.map((port) => new Promise((resolve) => {
+            const started = Date.now();
+            const sock = net.connect({ host, port });
+            let done = false;
+            const finish = (status, extra) => {
+              if (done) return;
+              done = true;
+              try { sock.destroy(); } catch { /* 已关 */ }
+              resolve({ port, status, ms: Date.now() - started, ...extra });
+            };
+            sock.setTimeout(timeout, () => finish('timeout'));
+            sock.on('connect', () => finish('open'));
+            sock.on('error', (e) => finish(e.code === 'ECONNREFUSED' ? 'refused' : 'error', { code: e.code }));
+          })));
+          let egress = null;
+          const echo = url.searchParams.get('echo');
+          if (echo) {
+            try {
+              const r = await fetch(echo, { signal: AbortSignal.timeout(10000) });
+              egress = { url: echo, body: (await r.text()).trim().slice(0, 160) };
+            } catch (e) { egress = { url: echo, error: String((e && e.message) || e) }; }
+          }
+          json(res, 200, { host, timeoutMs: timeout, egress, matrix });
+        })());
+      }
+
       // ---- 持久化端点：Postgres（重启后仍在）/ Key Value（缓存、队列）----
       // 只走本文件里写死的语句，不接受任意 SQL；值做单引号转义与长度上限。
 
@@ -941,6 +1032,61 @@ function main() {
     server.close(() => process.exit(0));
     setTimeout(() => process.exit(0), 5000).unref();
   }
+
+  // ---- WebSocket 隧道：/proxy?… ----
+  // 客户端先发一帧 TEXT = {"host":"…","port":443}，之后二进制帧双向直通 TCP。
+  // 出口是**本节点发起的连接** → 对方看到的是 Render 的共享 NAT 地址，不是你的本机。
+  // 鉴权走 header（不进请求行，所以不会落进 Render 的 HTTP 日志）。
+  server.on('upgrade', (req, socket, head) => {
+    const url = new URL(req.url, 'http://localhost');
+    if (url.pathname !== '/proxy') return socket.destroy();
+    if (!authed(req)) return socket.end('HTTP/1.1 404 Not Found\r\n\r\n');
+    const key = req.headers['sec-websocket-key'];
+    if (!key) return socket.destroy();
+    socket.write(
+      'HTTP/1.1 101 Switching Protocols\r\n' +
+      'Upgrade: websocket\r\nConnection: Upgrade\r\n' +
+      'Sec-WebSocket-Accept: ' + wsAccept(key) + '\r\n\r\n'
+    );
+    let upstream = null;
+    let target = null;
+    let queue = [];
+    const toClient = (payload, opcode = 2) => { try { socket.write(wsEncode(payload, opcode)); } catch { /* 已关 */ } };
+    const parse = makeWsParser(
+      (t) => {
+        if (target) return;
+        try {
+          const j = JSON.parse(t.toString('utf8'));
+          if (!j || !j.host || !j.port) throw new Error('要 host/port');
+          target = { host: String(j.host), port: Number(j.port) };
+          upstream = net.connect({ host: target.host, port: target.port });
+          upstream.on('connect', () => {
+            console.log('[proxy] → ' + target.host + ':' + target.port);
+            toClient(Buffer.from(JSON.stringify({ ok: true, to: target.host + ':' + target.port })), 1);
+            for (const q of queue) upstream.write(q);
+            queue = [];
+          });
+          upstream.on('data', (d) => toClient(d));
+          upstream.on('end', () => { toClient(Buffer.alloc(0), 0x8); try { socket.end(); } catch { /* 已关 */ } });
+          upstream.on('error', (e) => {
+            toClient(Buffer.from(JSON.stringify({ ok: false, error: String(e.code || e.message) })), 1);
+            toClient(Buffer.alloc(0), 0x8);
+            try { socket.end(); } catch { /* 已关 */ }
+          });
+        } catch (e) {
+          toClient(Buffer.from(JSON.stringify({ ok: false, error: String((e && e.message) || e) })), 1);
+          try { socket.end(); } catch { /* 已关 */ }
+        }
+      },
+      (b) => { if (upstream && upstream.writable) upstream.write(b); else queue.push(b); },
+      () => { try { socket.end(); } catch { /* 已关 */ } if (upstream) upstream.destroy(); },
+      (p) => { try { socket.write(wsEncode(p, 0xa)); } catch { /* 已关 */ } }
+    );
+    socket.on('data', (c) => parse(c));
+    if (head && head.length) parse(head);
+    socket.on('error', () => { if (upstream) upstream.destroy(); });
+    socket.on('close', () => { if (upstream) upstream.destroy(); });
+  });
 
   server.listen(PORT, () => {
     console.log(
