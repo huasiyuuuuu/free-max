@@ -6,6 +6,8 @@
  *   2) Worker : 进程内 worker_threads 池，顶掉「背景 worker 没有免费档、最低 $7/月」
  *   3) Cron   : 进程内 5 段 cron 解析器，顶掉「cron job 按分钟计费」
  *   4) Shell  : token 保护的 /admin/exec，顶掉「Shell/SSH 只有付费实例才有」
+ *   5) 持久化 : 零依赖 Postgres 客户端（SCRAM-SHA-256）+ 零依赖 Key Value（RESP），
+ *              顶掉「免费档没有持久盘」——重启后数据仍在（看 /admin/stats 的 db.boots）
  *
  * 零 npm 依赖 → 构建几乎不烧 pipeline minutes，冷启动更快，512MB 里更省。
  *
@@ -14,9 +16,13 @@
  *   WORKER_POOL=0         → 不起 worker 线程
  *   CRON_JOBS 留空        → 不跑任何定时任务
  *   RSS_LIMIT_MB 不设/0   → 关掉内存看门狗
+ *   DATABASE_URL 不设     → /admin/persist 与 /admin/deps 的 db 段返回明确错误，其余照常
+ *   REDIS_URL 不设        → /admin/kv 同上
  */
 
 const http = require('node:http');
+const net = require('node:net');
+const tls = require('node:tls');
 const crypto = require('node:crypto');
 const { execFile } = require('node:child_process');
 const { Worker, isMainThread, parentPort, threadId } = require('node:worker_threads');
@@ -34,6 +40,10 @@ const SHELL_BIN = process.env.SHELL_BIN || (IS_WIN ? 'cmd.exe' : '/bin/sh');
 const SHELL_FLAG = process.env.SHELL_FLAG || (SHELL_BIN.indexOf('cmd') >= 0 ? '/c' : '-c');
 const MAX_JOBS_KEPT = 200;
 const DEFAULT_CRON = 'keepalive=*/10 * * * *';
+// 免费 Postgres（1GB / 30 天到期）与免费 Key Value（25MB）连接串，由 Render 注入。
+// 不设时下面所有持久化端点返回明确错误，其余功能完全不受影响（本地 P0/P3 判据因此照旧全绿）。
+const PG_URL = process.env.DATABASE_URL || '';
+const KV_URL = process.env.REDIS_URL || '';
 
 // ============================ worker 侧 ============================
 // 同一个文件既是主进程也是 worker：省一个文件，也让镜像更小。
@@ -57,6 +67,320 @@ function runJob(job) {
     at: new Date().toISOString(),
     ms: Date.now() - started,
   };
+}
+
+// ============================ 零依赖 Postgres ============================
+// 免费档没有装 npm 依赖的余量，也不引 pg 驱动：直接说 Postgres 线协议
+// （StartupMessage + SCRAM-SHA-256 认证 + 简单查询）。只实现「够用且不越权」的部分：
+// 只有下面两个函数能发 SQL，全是本文件里写死的语句，不暴露任意 SQL 入口。
+const pgState = { ok: false, boots: null, lastError: PG_URL ? null : 'DATABASE_URL 未设置', lastQueryMs: null };
+
+function cstr(s) { return Buffer.concat([Buffer.from(String(s), 'utf8'), Buffer.from([0])]); }
+function i32(n) { const b = Buffer.alloc(4); b.writeInt32BE(n); return b; }
+function i16(n) { const b = Buffer.alloc(2); b.writeInt16BE(n); return b; }
+function pgFrame(type, payload) { return Buffer.concat([Buffer.from(type, 'ascii'), i32(payload.length + 4), payload]); }
+function sqlLit(s) { return "'" + String(s).replace(/'/g, "''") + "'"; }
+
+function parsePgUrl(raw) {
+  const u = new URL(raw);
+  const sslmode = u.searchParams.get('sslmode') || process.env.PGSSLMODE || '';
+  return {
+    host: u.hostname,
+    port: Number(u.port || 5432),
+    user: decodeURIComponent(u.username || ''),
+    password: decodeURIComponent(u.password || ''),
+    database: decodeURIComponent((u.pathname || '').replace(/^\//, '')) || 'postgres',
+    ssl: /require|verify/i.test(sslmode),
+  };
+}
+
+function pgOpen(cfg) {
+  return new Promise((resolve, reject) => {
+    const sock = cfg.ssl
+      ? tls.connect({ host: cfg.host, port: cfg.port, rejectUnauthorized: false })
+      : net.connect({ host: cfg.host, port: cfg.port });
+    let buf = Buffer.alloc(0);
+    const queue = [];
+    const waiters = [];
+    let failure = null;
+    const fail = (e) => {
+      failure = failure || e;
+      while (waiters.length) waiters.shift()(Promise.reject(failure));
+    };
+    sock.on('data', (chunk) => {
+      buf = Buffer.concat([buf, chunk]);
+      for (;;) {
+        if (buf.length < 5) break;
+        const len = buf.readInt32BE(1);
+        if (buf.length < 1 + len) break;
+        const msg = { type: String.fromCharCode(buf[0]), payload: buf.subarray(5, 1 + len) };
+        buf = buf.subarray(1 + len);
+        const w = waiters.shift();
+        if (w) w(Promise.resolve(msg)); else queue.push(msg);
+      }
+    });
+    sock.on('error', (e) => fail(e));
+    sock.on('close', () => fail(new Error('pg 连接被关闭')));
+    sock.setTimeout(20000, () => fail(new Error('pg 空闲超时')));
+    const next = (timeoutMs = 20000) => {
+      if (queue.length) return Promise.resolve(queue.shift());
+      if (failure) return Promise.reject(failure);
+      return new Promise((res, rej) => {
+        const t = setTimeout(() => rej(new Error('pg 等消息超时')), timeoutMs);
+        waiters.push((p) => { clearTimeout(t); p.then(res, rej); });
+      });
+    };
+    const startup = Buffer.concat([
+      i32(196608),
+      cstr('user'), cstr(cfg.user),
+      cstr('database'), cstr(cfg.database),
+      cstr('client_encoding'), cstr('UTF8'),
+      cstr('application_name'), cstr('free-max'),
+      Buffer.from([0]),
+    ]);
+    sock.write(Buffer.concat([i32(startup.length + 4), startup]));
+    resolve({ sock, next, write: (b) => sock.write(b), close: () => { try { sock.end(); } catch { /* 已关 */ } } });
+  });
+}
+
+function pgErrorOf(payload) {
+  // ErrorResponse: 一串 (byte code, cstr value)，以 0 结尾
+  const parts = [];
+  let i = 0;
+  while (i < payload.length && payload[i] !== 0) {
+    const code = String.fromCharCode(payload[i]);
+    const end = payload.indexOf(0, i + 1);
+    if (end < 0) break;
+    parts.push(code + '=' + payload.subarray(i + 1, end).toString('utf8'));
+    i = end + 1;
+  }
+  return parts.join(' ') || 'pg 未知错误';
+}
+
+function parseScramFields(text) {
+  const out = {};
+  for (const kv of String(text).split(',')) {
+    const eq = kv.indexOf('=');
+    if (eq > 0) out[kv.slice(0, eq)] = kv.slice(eq + 1);
+  }
+  return out;
+}
+
+async function pgAuth(conn, cfg) {
+  const nonce = crypto.randomBytes(18).toString('base64');
+  const clientFirstBare = 'n=,r=' + nonce;
+  let authMessage = '';
+  let authDone = false;
+  for (;;) {
+    const m = await conn.next();
+    if (m.type === 'E') throw new Error(pgErrorOf(m.payload));
+    // 认证完成后服务端还会发 ParameterStatus/BackendKeyData，最后是 ReadyForQuery。
+    // 必须一路读到那个 'Z' 才返回：否则启动阶段的 'Z' 会被查询循环当成「结果结束」，
+    // 于是每条 SELECT 都读回 0 行（本地 PG 实测抓到的坑）。
+    if (m.type === 'Z') {
+      if (authDone) return;
+      continue;
+    }
+    if (m.type !== 'R') continue;
+    const code = m.payload.readInt32BE(0);
+    if (code === 0) { authDone = true; continue; } // AuthenticationOk
+    if (code === 10) {
+      // SASL：挑 SCRAM-SHA-256（PG 10+ 默认）
+      const mechs = m.payload.subarray(4).toString('utf8').split('\0').filter(Boolean);
+      if (!mechs.includes('SCRAM-SHA-256')) throw new Error('服务端只支持 ' + mechs.join('/') + '，本客户端只实现 SCRAM-SHA-256');
+      const init = Buffer.concat([cstr('SCRAM-SHA-256'), i32(Buffer.byteLength('n,,' + clientFirstBare)), Buffer.from('n,,' + clientFirstBare, 'utf8')]);
+      conn.write(pgFrame('p', init));
+      continue;
+    }
+    if (code === 11) {
+      // SASLContinue：r=<server nonce>, s=<salt b64>, i=<iterations>
+      const f = parseScramFields(m.payload.subarray(4).toString('utf8'));
+      const serverNonce = f.r || '';
+      if (!serverNonce.startsWith(nonce)) throw new Error('SCRAM nonce 不匹配');
+      const salt = Buffer.from(f.s || '', 'base64');
+      const iters = Number(f.i || 4096);
+      const salted = crypto.pbkdf2Sync(Buffer.from(cfg.password, 'utf8'), salt, iters, 32, 'sha256');
+      const clientKey = crypto.createHmac('sha256', salted).update('Client Key').digest();
+      const storedKey = crypto.createHash('sha256').update(clientKey).digest();
+      const clientFinalNoProof = 'c=biws,r=' + serverNonce;
+      authMessage = clientFirstBare + ',' + m.payload.subarray(4).toString('utf8') + ',' + clientFinalNoProof;
+      const clientSig = crypto.createHmac('sha256', storedKey).update(authMessage).digest();
+      const proof = Buffer.alloc(32);
+      for (let i = 0; i < 32; i++) proof[i] = clientKey[i] ^ clientSig[i];
+      conn.write(pgFrame('p', Buffer.from(clientFinalNoProof + ',p=' + proof.toString('base64'), 'utf8')));
+      conn.scram = { salted, authMessage };
+      continue;
+    }
+    if (code === 12) {
+      // SASLFinal：校验服务端签名（双向认证）
+      const f = parseScramFields(m.payload.subarray(4).toString('utf8'));
+      if (conn.scram) {
+        const serverKey = crypto.createHmac('sha256', conn.scram.salted).update('Server Key').digest();
+        const expect = crypto.createHmac('sha256', serverKey).update(conn.scram.authMessage).digest('base64');
+        if (f.v && f.v !== expect) throw new Error('SCRAM 服务端签名不符');
+      }
+      continue;
+    }
+    if (code === 3 || code === 5 || code === 7) throw new Error('服务端要求明文/摘要认证（code=' + code + '），本客户端只做 SCRAM-SHA-256');
+  }
+}
+
+function parseRowDescription(payload) {
+  const n = payload.readInt16BE(0);
+  const fields = [];
+  let i = 2;
+  for (let k = 0; k < n; k++) {
+    const end = payload.indexOf(0, i);
+    fields.push(payload.subarray(i, end).toString('utf8'));
+    i = end + 1 + 4 + 2 + 4 + 2 + 4 + 2;
+  }
+  return fields;
+}
+
+function parseDataRow(payload, fields) {
+  const n = payload.readInt16BE(0);
+  const row = {};
+  let i = 2;
+  for (let k = 0; k < n; k++) {
+    const len = payload.readInt32BE(i);
+    i += 4;
+    const name = fields[k] || String(k);
+    if (len < 0) { row[name] = null; continue; }
+    row[name] = payload.subarray(i, i + len).toString('utf8');
+    i += len;
+  }
+  return row;
+}
+
+async function pgQuery(sql, timeoutMs = 20000) {
+  if (!PG_URL) throw new Error('DATABASE_URL 未设置');
+  const cfg = parsePgUrl(PG_URL);
+  const t0 = Date.now();
+  const conn = await pgOpen(cfg);
+  try {
+    await pgAuth(conn, cfg);
+    conn.write(pgFrame('Q', Buffer.concat([Buffer.from(sql, 'utf8'), Buffer.from([0])])));
+    let fields = [];
+    const rows = [];
+    let command = '';
+    let err = null;
+    for (;;) {
+      const m = await conn.next(timeoutMs);
+      if (m.type === 'T') fields = parseRowDescription(m.payload);
+      else if (m.type === 'D') rows.push(parseDataRow(m.payload, fields));
+      else if (m.type === 'C') command = m.payload.toString('utf8').replace(/\0+$/, '');
+      else if (m.type === 'E') err = pgErrorOf(m.payload);
+      else if (m.type === 'Z') break;
+    }
+    if (err) throw new Error(err);
+    pgState.ok = true;
+    pgState.lastError = null;
+    pgState.lastQueryMs = Date.now() - t0;
+    return { rows, fields, command, ms: Date.now() - t0 };
+  } catch (e) {
+    pgState.ok = false;
+    pgState.lastError = String((e && e.message) || e);
+    throw e;
+  } finally {
+    conn.close();
+  }
+}
+
+// 启动时记一次「开机」：重启后这个计数会 +1 —— 持久化的可翻牌证据之一
+async function pgRecordBoot() {
+  if (!PG_URL) return;
+  try {
+    await pgQuery('CREATE TABLE IF NOT EXISTS free_max_boot (name text PRIMARY KEY, boots integer NOT NULL DEFAULT 0, last_boot timestamptz NOT NULL DEFAULT now())');
+    const r = await pgQuery(
+      "INSERT INTO free_max_boot (name, boots, last_boot) VALUES ('free-max', 1, now()) " +
+      'ON CONFLICT (name) DO UPDATE SET boots = free_max_boot.boots + 1, last_boot = now() ' +
+      'RETURNING boots, last_boot'
+    );
+    pgState.boots = r.rows[0] ? Number(r.rows[0].boots) : null;
+    console.log('[pg] 开机计数 boots=' + pgState.boots + ' (' + r.ms + 'ms)');
+  } catch (e) {
+    console.error('[pg] 开机记录失败: ' + ((e && e.message) || e));
+  }
+}
+
+// ============================ 零依赖 Key Value（RESP）============================
+function respParse(buf) {
+  if (!buf.length) return null;
+  const t = buf[0];
+  const nl = buf.indexOf('\r\n', 1);
+  if (nl < 0) return null;
+  const line = buf.subarray(1, nl).toString('utf8');
+  const rest = buf.subarray(nl + 2);
+  if (t === 43) return { value: line, rest };                                   // +simple
+  if (t === 45) return { value: new Error(line), rest };                        // -error
+  if (t === 58) return { value: Number(line), rest };                           // :int
+  if (t === 36) {                                                               // $bulk
+    const n = Number(line);
+    if (n === -1) return { value: null, rest };
+    if (rest.length < n + 2) return null;
+    return { value: rest.subarray(0, n).toString('utf8'), rest: rest.subarray(n + 2) };
+  }
+  if (t === 42) {                                                               // *array
+    const n = Number(line);
+    if (n === -1) return { value: null, rest };
+    const out = [];
+    let cur = rest;
+    for (let i = 0; i < n; i++) {
+      const p = respParse(cur);
+      if (!p) return null;
+      out.push(p.value);
+      cur = p.rest;
+    }
+    return { value: out, rest: cur };
+  }
+  return null;
+}
+
+function kvCommand(args, timeoutMs = 8000) {
+  return new Promise((resolve, reject) => {
+    if (!KV_URL) return reject(new Error('REDIS_URL 未设置'));
+    const u = new URL(KV_URL);
+    const port = Number(u.port || 6379);
+    const sock = u.protocol === 'rediss:'
+      ? tls.connect({ host: u.hostname, port, rejectUnauthorized: false })
+      : net.connect({ host: u.hostname, port });
+    const t0 = Date.now();
+    let buf = Buffer.alloc(0);
+    let needed = 0;
+    let done = false;
+    const encode = (a) => Buffer.concat([
+      Buffer.from('*' + a.length + '\r\n', 'utf8'),
+      ...a.map((x) => Buffer.concat([Buffer.from('$' + Buffer.byteLength(String(x)) + '\r\n', 'utf8'), Buffer.from(String(x), 'utf8'), Buffer.from('\r\n')])),
+    ]);
+    const finish = (err, val) => {
+      if (done) return;
+      done = true;
+      clearTimeout(timer);
+      try { sock.end(); } catch { /* 已关 */ }
+      if (err) reject(err); else resolve({ value: val, ms: Date.now() - t0 });
+    };
+    const timer = setTimeout(() => finish(new Error('kv 超时')), timeoutMs);
+    sock.on('connect', () => {
+      // 内网连接串没有密码；有密码时把 AUTH 与命令一起发，按顺序收两个应答
+      needed = u.password ? 2 : 1;
+      if (u.password) sock.write(encode(['AUTH', decodeURIComponent(u.password)]));
+      sock.write(encode(args));
+    });
+    sock.on('data', (chunk) => {
+      buf = Buffer.concat([buf, chunk]);
+      for (;;) {
+        const p = respParse(buf);
+        if (!p) return;
+        buf = p.rest;
+        needed--;
+        if (needed > 0) continue;          // 这是 AUTH 的应答
+        if (p.value instanceof Error) return finish(p.value);
+        return finish(null, p.value);
+      }
+    });
+    sock.on('error', (e) => finish(e));
+    sock.on('close', () => finish(new Error('kv 连接被关闭')));
+  });
 }
 
 // ============================ 主进程 ============================
@@ -363,6 +687,11 @@ function main() {
           'POST /admin/cron?name=x&spec=...   运行时加定时任务',
           'POST /admin/cron/delete?name=x     删定时任务',
           'GET  /admin/exec?cmd=ls -la        执行 shell 命令（= 没有 SSH 时的替代品）',
+          'GET  /admin/deps                   探活 Postgres / Key Value（含协议耗时）',
+          'POST /admin/persist?key=k&value=v  Postgres 落一行（重启后仍在）',
+          'GET  /admin/persist[?key=k]        读回（不带 key = 列最近 50 行 + 开机次数）',
+          'POST /admin/kv?key=k&value=v       Key Value 写（免费档 persistenceMode=off，重启即丢）',
+          'GET  /admin/kv[?key=k]             Key Value 读（不带 key = DBSIZE）',
           '',
           '鉴权：只认 header `x-admin-token`（不再支持 ?token=，避免密钥进请求日志）',
         ].join('\n')
@@ -408,7 +737,93 @@ function main() {
           cron: tasks.map((t) => ({ name: t.name, spec: t.cron.spec, runs: t.runs, lastRun: t.lastRun })),
           lastTickAt,
           loadavg: require('node:os').loadavg(),
+          // 免费档榨干项：有没有真接到持久层（重启后数据仍在的判据看 boots）
+          db: { configured: !!PG_URL, ok: pgState.ok, boots: pgState.boots, lastQueryMs: pgState.lastQueryMs, error: pgState.lastError },
+          kv: { configured: !!KV_URL },
         });
+      }
+
+      // ---- 持久化端点：Postgres（重启后仍在）/ Key Value（缓存、队列）----
+      // 只走本文件里写死的语句，不接受任意 SQL；值做单引号转义与长度上限。
+      const guard = (p) => p.catch((e) => json(res, 500, { error: String((e && e.message) || e) }));
+
+      if (url.pathname === '/admin/deps') {
+        return guard((async () => {
+          const out = {
+            db: { configured: !!PG_URL, ok: false, boots: pgState.boots, ms: null, error: pgState.lastError },
+            kv: { configured: !!KV_URL, ok: false, ms: null, error: null },
+          };
+          if (PG_URL) {
+            try {
+              const r = await pgQuery('SELECT now() AS now, current_database() AS db, version() AS version');
+              out.db.ok = true; out.db.ms = r.ms;
+              out.db.now = r.rows[0] && r.rows[0].now;
+              out.db.name = r.rows[0] && r.rows[0].db;
+              out.db.version = String((r.rows[0] && r.rows[0].version) || '').split(' ').slice(0, 2).join(' ');
+            } catch (e) { out.db.error = String((e && e.message) || e); }
+          }
+          if (KV_URL) {
+            try {
+              const r = await kvCommand(['PING']);
+              out.kv.ok = r.value === 'PONG';
+              out.kv.ms = r.ms;
+              out.kv.ping = r.value;
+            } catch (e) { out.kv.error = String((e && e.message) || e); }
+          }
+          json(res, 200, out);
+        })());
+      }
+
+      if (url.pathname === '/admin/persist') {
+        const key = (url.searchParams.get('key') || '').trim();
+        const value = url.searchParams.get('value');
+        if (req.method === 'POST') {
+          if (!key || value === null) return json(res, 400, { error: '要 key 与 value（query 参数）' });
+          if (key.length > 128 || !/^[A-Za-z0-9_.:-]+$/.test(key)) return json(res, 400, { error: 'key 只允许 128 字符内的 [A-Za-z0-9_.:-]' });
+          if (value.length > 4000) return json(res, 413, { error: 'value 上限 4000 字符' });
+          return guard((async () => {
+            await pgQuery('CREATE TABLE IF NOT EXISTS free_max_persist (key text PRIMARY KEY, value text NOT NULL, at timestamptz NOT NULL DEFAULT now(), writes integer NOT NULL DEFAULT 0)');
+            const r = await pgQuery(
+              'INSERT INTO free_max_persist (key, value, at, writes) VALUES (' + sqlLit(key) + ', ' + sqlLit(value) + ', now(), 1) ' +
+              'ON CONFLICT (key) DO UPDATE SET value = EXCLUDED.value, at = now(), writes = free_max_persist.writes + 1 ' +
+              'RETURNING key, value, at, writes'
+            );
+            json(res, 200, { row: r.rows[0], ms: r.ms });
+          })());
+        }
+        return guard((async () => {
+          if (key) {
+            const r = await pgQuery('SELECT key, value, at, writes FROM free_max_persist WHERE key = ' + sqlLit(key));
+            return json(res, r.rows.length ? 200 : 404, { row: r.rows[0] || null, ms: r.ms });
+          }
+          const r = await pgQuery('SELECT key, value, at, writes FROM free_max_persist ORDER BY at DESC LIMIT 50');
+          const c = await pgQuery('SELECT count(*)::int AS n FROM free_max_persist');
+          json(res, 200, { rows: r.rows, count: c.rows[0] ? Number(c.rows[0].n) : null, boots: pgState.boots, ms: r.ms });
+        })());
+      }
+
+      if (url.pathname === '/admin/kv') {
+        const key = (url.searchParams.get('key') || '').trim();
+        const value = url.searchParams.get('value');
+        if (req.method === 'POST') {
+          if (!key || value === null) return json(res, 400, { error: '要 key 与 value' });
+          if (key.length > 128) return json(res, 400, { error: 'key 上限 128 字符' });
+          if (value.length > 4000) return json(res, 413, { error: 'value 上限 4000 字符' });
+          return guard((async () => {
+            const r = await kvCommand(['SET', key, value]);
+            json(res, 200, { set: r.value, ms: r.ms, note: '免费 Key Value 默认 persistenceMode=off，重启即丢；要跨重启只能放 Postgres' });
+          })());
+        }
+        if (!key) {
+          return guard((async () => {
+            const r = await kvCommand(['DBSIZE']);
+            json(res, 200, { dbsize: r.value, ms: r.ms });
+          })());
+        }
+        return guard((async () => {
+          const r = await kvCommand(['GET', key]);
+          json(res, r.value === null ? 404 : 200, { key, value: r.value, ms: r.ms });
+        })());
       }
 
       if (url.pathname === '/admin/job' && req.method === 'POST') {
@@ -479,6 +894,8 @@ function main() {
       ' cronTasks=' + tasks.length +
       ' node=' + process.version
     );
+    // 开机计数：重启后 free_max_boot.boots 会 +1 —— 「数据真的在库里」的可翻牌证据
+    pgRecordBoot();
   });
 }
 
