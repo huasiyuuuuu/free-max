@@ -1,0 +1,15 @@
+{
+  "name": "free-max",
+  "version": "1.0.0",
+  "private": true,
+  "description": "Render 免费档榨干：一个 0 元 web service 顶掉 web + background worker + cron + shell",
+  "main": "server.js",
+  "scripts": {
+    "start": "node server.js"
+  },
+  "engines": {
+    "node": ">=20"
+  },
+  "dependencies": {},
+  "devDependencies": {}
+}

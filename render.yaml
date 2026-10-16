@@ -1,0 +1,76 @@
+# free-max / render.yaml —— 全部按「免费档榨到极限」配置
+# 用法：把 free-max/ 里的东西放到仓库根（render.yaml、package.json、server.js、.github/），
+#       Dashboard → New → Blueprint → 选仓库 → Apply。
+#
+# 免费档硬限制（官方 https://render.com/docs/free）：
+#   · 750 实例小时 / 月 / workspace —— 24×7 一个服务约 744h，刚好塞满；第二个必爆
+#   · 15 分钟没有入站流量就休眠（HTTP 和 WebSocket 都算流量），唤醒约 1 分钟
+#   · 文件系统是临时的：重启/重新部署/休眠都会丢本地文件（别用本地 SQLite）
+#   · 不能：多实例、持久盘、SSH/Shell、one-off job、edge caching、接收私网流量
+#   · 免费 Postgres：每 workspace 只能有 1 个，1GB，**创建 30 天后过期**
+#   · 免费 Key Value：25MB
+
+services:
+  # ── 一个免费 web service，同时干 web + worker + cron + shell 四份活 ──
+  - type: web
+    name: free-max
+    runtime: node
+    plan: free                                    # schema 已确认 serverPlan 枚举里有 "free"
+    region: oregon                                # 想换 singapore/ohio 就把三处 region 一起改；报错就回 oregon
+    numInstances: 1                               # 免费档本来也不给扩
+    buildCommand: npm install --omit=dev --no-audit --no-fund   # 零依赖，构建分钟几乎不烧
+    startCommand: node server.js
+    healthCheckPath: /healthz                     # 保活和健康检查都打这个
+    autoDeploy: true
+    previews:
+      generation: "off"                           # 关掉 PR 预览：预览实例也吃那 750 实例小时（off 必须加引号，否则 YAML 会读成布尔 false）
+    envVars:
+      - key: NODE_VERSION
+        value: "22"
+      - key: ADMIN_TOKEN
+        generateValue: true                       # 随机 256bit；要在本机用就去 Dashboard 复制
+      - key: WORKER_POOL
+        value: "2"                                # 进程内 worker 线程数（顶掉付费 background worker）
+      - key: RSS_LIMIT_MB
+        value: "420"                              # 512MB 里留余量，超了主动退出让 Render 重启
+      - key: EXEC_TIMEOUT_MS
+        value: "20000"
+      - key: CRON_JOBS
+        value: "keepalive=*/10 * * * *;nightly=0 3 * * *"   # 进程内 cron（cronPlan 枚举里没有 free，只能自己跑）
+      - fromGroup: free-max-shared                # 整组导入（组里两个变量都进来）；注意它不能和 key 同时写
+      - key: DATABASE_URL
+        fromDatabase:
+          name: free-max-db
+          property: connectionString
+      - key: REDIS_URL
+        fromService:
+          type: keyvalue
+          name: free-max-kv
+          property: connectionString
+
+  # ── 免费 Key Value（Redis 协议，25MB）：当缓存 / 队列用 ──
+  # ipAllowList 是 schema 里的必填项：空数组 = 只走内网、公网不可达（也就是免费 KV 的默认姿态）。
+  # 要让本机能直连，就填你本机公网 IP，例如 {source: 203.0.113.42/32}
+  - type: keyvalue
+    name: free-max-kv
+    plan: free
+    region: oregon
+    ipAllowList: []
+
+envVarGroups:
+  # 全 workspace 共享的配置抽屉：多服务时改一处、全体重新部署
+  # 注意（schema 已确认）：组的 envVars 只支持 key/value/generateValue，不能 fromService/fromDatabase
+  - name: free-max-shared
+    envVars:
+      - key: SESSION_SECRET
+        generateValue: true
+      - key: LOG_LEVEL
+        value: info
+
+databases:
+  # 免费 Postgres：1GB / 256MB RAM / 30 天后过期。
+  # 到期前用 pg_dump 导出 → 删库 → 重新 Apply 一个 → 灌回去，就是免费的「续命」循环。
+  # 注意：一个 workspace 同时只能有 1 个免费 Postgres，已有的话先把上面这段删掉。
+  - name: free-max-db
+    plan: free
+    region: oregon
