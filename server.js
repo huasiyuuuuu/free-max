@@ -697,6 +697,7 @@ function main() {
           'POST /admin/cron/delete?name=x     删定时任务',
           'GET  /admin/exec?cmd=ls -la        执行 shell 命令（= 没有 SSH 时的替代品）',
           'GET  /admin/deps                   探活 Postgres / Key Value（含协议耗时）',
+          'GET  /admin/net                    网络身份自报：出口 IP / 监听端口 / 主机名',
           'POST /admin/persist?key=k&value=v  Postgres 落一行（重启后仍在）',
           'GET  /admin/persist[?key=k]        读回（不带 key = 列最近 50 行 + 开机次数）',
           'POST /admin/kv?key=k&value=v       Key Value 写（免费档 persistenceMode=off，重启即丢）',
@@ -750,6 +751,41 @@ function main() {
           db: { configured: !!PG_URL, ok: pgState.ok, boots: pgState.boots, lastQueryMs: pgState.lastQueryMs, error: pgState.lastError },
           kv: { configured: !!KV_URL },
         });
+      }
+
+      // ---- 网络身份自报：出口 IP / 监听端口 / 主机名（免费档没有 Dashboard Shell，这是替代品）----
+      // 全部只读、只查本文件写死的语句、不向任何第三方站点发请求。
+      if (url.pathname === '/admin/net') {
+        return guard((async () => {
+          const os = require('node:os');
+          const fs = require('node:fs');
+          const out = {
+            hostname: os.hostname(),
+            listenPort: PORT,
+            podIPv4: Object.values(os.networkInterfaces()).flat().filter((i) => i && i.family === 'IPv4' && !i.internal).map((i) => i.address),
+            uptimeSec: Math.round(process.uptime()),
+          };
+          // 监听端口：直接读 /proc/net/tcp（容器里没有 ss/netstat）
+          try {
+            const decode = (hex) => parseInt(hex, 16);
+            const lines = String(fs.readFileSync('/proc/net/tcp', 'utf8')).trim().split('\n').slice(1);
+            out.listenSockets = lines
+              .map((l) => l.trim().split(/\s+/))
+              .filter((f) => f[3] === '0A')
+              .map((f) => ({ port: decode(f[1].split(':')[1]), addr: f[1].split(':')[0] }));
+          } catch (e) { out.listenSockets = null; out.listenSocketsError = String((e && e.message) || e); }
+          // 出口 IP：Postgres 眼中的对端地址 = 本服务的出口 IP（共享网段）；顺带拿服务端地址
+          if (PG_URL) {
+            try {
+              const r = await pgQuery('SELECT inet_client_addr()::text AS outbound_ip, inet_server_addr()::text AS pg_ip, inet_server_port() AS pg_port, current_user AS db_user');
+              out.pgClientAddr = r.rows[0] && r.rows[0].outbound_ip;
+              out.pgServerAddr = r.rows[0] && r.rows[0].pg_ip;
+              out.pgServerPort = r.rows[0] && r.rows[0].pg_port;
+              out.pgUser = r.rows[0] && r.rows[0].db_user;
+            } catch (e) { out.pgError = String((e && e.message) || e); }
+          }
+          json(res, 200, out);
+        })());
       }
 
       // ---- 持久化端点：Postgres（重启后仍在）/ Key Value（缓存、队列）----
