@@ -1,0 +1,48 @@
+<!doctype html>
+<html lang="zh">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>free-max · 静态面板</title>
+<style>
+  :root { color-scheme: dark }
+  body { margin:0; font:15px/1.6 ui-monospace,SFMono-Regular,Menlo,monospace; background:#0b0f14; color:#d7e0ea }
+  main { max-width:44rem; margin:6vh auto; padding:0 1.2rem }
+  h1 { font-size:1.25rem; margin:0 0 .3rem }
+  .sub { color:#7b8a9a; margin-bottom:1.6rem }
+  table { border-collapse:collapse; width:100% }
+  td,th { text-align:left; padding:.35rem .5rem; border-bottom:1px solid #1d2733 }
+  th { color:#7b8a9a; font-weight:400 }
+  code { color:#8ee6a8 }
+  .ok { color:#8ee6a8 } .bad { color:#f2777a }
+  footer { margin-top:2rem; color:#5b6876; font-size:.85rem }
+</style>
+</head>
+<body>
+<main>
+  <h1>free-max · 静态面板</h1>
+  <div class="sub">这一页由 Render <strong>Static Site</strong> 提供（永久免费、吃 CDN、<strong>不消耗实例小时</strong>）。</div>
+
+  <table>
+    <tr><th>项</th><th>值</th></tr>
+    <tr><td>静态站</td><td><code id="host">-</code></td></tr>
+    <tr><td>动态服务</td><td><code id="api">-</code></td></tr>
+    <tr><td>/healthz</td><td id="health">检测中…</td></tr>
+  </table>
+
+  <footer>把动态服务的地址填进 <code>API_BASE</code> 下面那行即可（静态站与动态服务是两个资源，互不影响实例小时）。</footer>
+  <script>
+    // 静态站不会替动态服务背流量：这里发起的请求算在「浏览器 → 动态服务」上，
+    // 静态站自己的出网走 CDN。改这一行即可指向你的动态服务。
+    var API_BASE = '';
+    document.getElementById('host').textContent = location.host;
+    document.getElementById('api').textContent = API_BASE || '(未配置)';
+    var h = document.getElementById('health');
+    if (!API_BASE) { h.textContent = '未配置 API_BASE'; h.className = ''; return; }
+    fetch(API_BASE + '/healthz').then(function (r) { return r.json(); }).then(function (j) {
+      h.textContent = 'ok=' + j.ok + ' upSec=' + j.upSec; h.className = j.ok ? 'ok' : 'bad';
+    }).catch(function (e) { h.textContent = '请求失败: ' + e.message; h.className = 'bad'; });
+  </script>
+</main>
+</body>
+</html>
