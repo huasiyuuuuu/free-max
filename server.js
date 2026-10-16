@@ -221,7 +221,16 @@ async function pgAuth(conn, cfg) {
       }
       continue;
     }
-    if (code === 3 || code === 5 || code === 7) throw new Error('服务端要求明文/摘要认证（code=' + code + '），本客户端只做 SCRAM-SHA-256');
+    if (code === 5) {
+      // AuthenticationMD5Password（Render 的 Postgres 实测用这个，不是 SCRAM）：
+      // 应答 = "md5" + md5( md5(password+user) + salt4 )
+      const salt = m.payload.subarray(4, 8);
+      const inner = crypto.createHash('md5').update(cfg.password + cfg.user).digest('hex');
+      const outer = 'md5' + crypto.createHash('md5').update(Buffer.concat([Buffer.from(inner, 'ascii'), salt])).digest('hex');
+      conn.write(pgFrame('p', cstr(outer)));
+      continue;
+    }
+    if (code === 3 || code === 7) throw new Error('服务端要求明文/GSS 认证（code=' + code + '），本客户端只做 MD5 与 SCRAM-SHA-256');
   }
 }
 
