@@ -1040,6 +1040,15 @@ function main() {
     setTimeout(() => process.exit(0), 5000).unref();
   }
 
+  // 隧道节点必须扛得住单个坏 socket：实测客户端粗暴断开会让 upgrade socket 抛未捕获 ECONNRESET，
+  // **整个实例直接退出**（等于一条烂连接打掉全池）。这里兜底记录并继续服务，不退出。
+  process.on('uncaughtException', (e) => {
+    console.error('[fatal-keepalive] ' + String((e && e.stack) || e).split('\n').slice(0, 3).join(' | '));
+  });
+  process.on('unhandledRejection', (e) => {
+    console.error('[fatal-keepalive] unhandledRejection ' + String((e && e.message) || e));
+  });
+
   // ---- WebSocket 隧道：/proxy?… ----
   // 两种模式：
   //   ① 单流（首帧 TEXT = {"host","port"}）—— 兼容早期客户端；
@@ -1057,6 +1066,7 @@ function main() {
       'Upgrade: websocket\r\nConnection: Upgrade\r\n' +
       'Sec-WebSocket-Accept: ' + wsAccept(key) + '\r\n\r\n'
     );
+    socket.on('error', () => { /* 立刻兜住：见上面 fatal-keepalive 的注释 */ });
     let upstream = null;
     let target = null;
     let queue = [];
