@@ -458,7 +458,9 @@ function makeWsParser(onText, onBinary, onClose, onPing) {
 // 装到了构建用户的 HOME，运行期看不到（`browser.available` 一直是 false）。这里统一钉到应用目录内。
 // 构建命令必须用同一个路径：PLAYWRIGHT_BROWSERS_PATH=$PWD/.pw-browsers npx playwright-core@1.64.1 install chromium
 process.env.PLAYWRIGHT_BROWSERS_PATH = process.env.PLAYWRIGHT_BROWSERS_PATH || require('node:path').join(__dirname, '.pw-browsers');
-const browserState = { proc: null, busy: false, lastUse: 0, launches: 0, pages: 0, lastError: null };
+const browserState = { proc: null, busy: false, lastUse: 0, launches: 0, pages: 0, lastError: null, queue: [], served: 0, failed: 0 };
+const BROWSER_QUEUE_MAX = Number(process.env.BROWSER_QUEUE_MAX || 8);      // 排队深度
+const BROWSER_QUEUE_WAIT_MS = Number(process.env.BROWSER_QUEUE_WAIT_MS || 120000);  // 排队等待上限
 const BROWSE_TIMEOUT_MS = Number(process.env.BROWSE_TIMEOUT_MS || 60000);
 const BROWSER_IDLE_MS = Number(process.env.BROWSER_IDLE_MS || 90000);
 // 「可用」判据必须是**浏览器二进制真在**，不能只看 playwright-core 能不能 require ——
@@ -487,29 +489,67 @@ async function browserGet() {
   return browserState.proc;
 }
 
+// 免费档一次只能跑一页：并发请求**排队**而不是直接失败（产线可以放心并发打）
+function browserAcquire() {
+  return new Promise((resolve, reject) => {
+    if (!browserState.busy) { browserState.busy = true; resolve(); return; }
+    if (browserState.queue.length >= BROWSER_QUEUE_MAX) { reject(new Error('浏览器队列满（' + BROWSER_QUEUE_MAX + '）')); return; }
+    const item = { resolve, reject };
+    item.timer = setTimeout(() => {
+      const i = browserState.queue.indexOf(item);
+      if (i >= 0) browserState.queue.splice(i, 1);
+      reject(new Error('排队超时 ' + BROWSER_QUEUE_WAIT_MS + 'ms'));
+    }, BROWSER_QUEUE_WAIT_MS);
+    if (item.timer.unref) item.timer.unref();
+    browserState.queue.push(item);
+  });
+}
+function browserRelease() {
+  const next = browserState.queue.shift();
+  if (next) { clearTimeout(next.timer); next.resolve(); }   // busy 保持 true，直接交给下一个
+  else browserState.busy = false;
+}
+
+// 导航带一次重试：首次用 domcontentloaded，失败后换 commit（弱网/重定向页常见）
+async function navigate(page, target, waitUntil) {
+  const attempts = [];
+  for (let i = 1; i <= 2; i++) {
+    try {
+      const r = await page.goto(target, { timeout: BROWSE_TIMEOUT_MS, waitUntil: i === 1 ? (waitUntil || 'domcontentloaded') : 'commit' });
+      attempts.push({ attempt: i, ok: true, waitUntil: i === 1 ? (waitUntil || 'domcontentloaded') : 'commit' });
+      return { resp: r, attempts };
+    } catch (e) {
+      attempts.push({ attempt: i, ok: false, error: String((e && e.message) || e).slice(0, 120) });
+      if (i === 2) { const err = new Error('导航失败（2 次尝试）: ' + attempts.map((a) => a.error).join(' | ')); err.attempts = attempts; throw err; }
+    }
+  }
+}
+
 async function browse(target, opts = {}) {
   if (!browserAvailable()) throw new Error('playwright-core 未安装（构建期 postinstall 未跑？）');
-  if (browserState.busy) throw new Error('浏览器忙（免费档一次一页）');
-  browserState.busy = true;
+  await browserAcquire();
   const t0 = Date.now();
   let ctx = null;
   try {
     const b = await browserGet();
     ctx = await b.newContext({ viewport: { width: 900, height: 650 }, userAgent: opts.userAgent });
     const page = await ctx.newPage();
-    const resp = await page.goto(target, { timeout: BROWSE_TIMEOUT_MS, waitUntil: opts.waitUntil || 'domcontentloaded' });
+    const nav = await navigate(page, target, opts.waitUntil);
+    const resp = nav.resp;
     const title = await page.title();
     const text = String(await page.evaluate(() => (document.body ? document.body.innerText : ''))).replace(/[ \t]+\n/g, '\n').slice(0, 4000);
-    const out = { url: page.url(), status: resp ? resp.status() : null, title, text, ms: Date.now() - t0, launches: browserState.launches };
+    const out = { url: page.url(), status: resp ? resp.status() : null, title, text, ms: Date.now() - t0, launches: browserState.launches, attempts: nav.attempts };
     if (opts.links) out.links = await page.evaluate(() => Array.from(document.querySelectorAll('a[href]')).map((a) => a.href).slice(0, 200));
     if (opts.shot) out.png = (await page.screenshot({ type: 'png' })).toString('base64');
     browserState.pages++;
+    browserState.served++;
     return out;
   } catch (e) {
     browserState.lastError = String((e && e.message) || e).slice(0, 300);
+    browserState.failed++;
     throw e;
   } finally {
-    browserState.busy = false;
+    browserRelease();
     browserState.lastUse = Date.now();
     if (ctx) { try { await ctx.close(); } catch { /* 已关 */ } }
   }
@@ -873,7 +913,7 @@ function main() {
           // 免费档榨干项：有没有真接到持久层（重启后数据仍在的判据看 boots）
           db: { configured: !!PG_URL, ok: pgState.ok, boots: pgState.boots, lastQueryMs: pgState.lastQueryMs, error: pgState.lastError },
           kv: { configured: !!KV_URL },
-          browser: { available: browserAvailable(), launches: browserState.launches, pages: browserState.pages, busy: browserState.busy, lastError: browserState.lastError },
+          browser: { available: browserAvailable(), launches: browserState.launches, pages: browserState.pages, busy: browserState.busy, queued: browserState.queue.length, served: browserState.served, failed: browserState.failed, lastError: browserState.lastError },
         });
       }
 
