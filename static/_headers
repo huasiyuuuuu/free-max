@@ -1,4 +1,4 @@
 /*
-  x-free-max-static: 1
-  x-frame-options: DENY
-  x-content-type-options: nosniff
+  x-first-test: a
+  x-second-test: b
+  x-third-test: c
