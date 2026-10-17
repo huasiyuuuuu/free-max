@@ -454,6 +454,10 @@ function makeWsParser(onText, onBinary, onClose, onPing) {
 // 2 页并发无 OOM（Wikipedia 24s、HN 19.6s，都是 0.15 核下的真实速度）。
 // 关键前提：403MB 的浏览器必须在**构建期**装好（package.json 的 postinstall），否则每次冷启动要重下 191MB。
 // 内存策略：单浏览器 + 串行（一次一页）+ 空闲 90s 自动关。
+// 浏览器安装路径必须**固定且构建/运行一致**：实测踩过 —— 默认 `~/.cache/ms-playwright` 在构建期
+// 装到了构建用户的 HOME，运行期看不到（`browser.available` 一直是 false）。这里统一钉到应用目录内。
+// 构建命令必须用同一个路径：PLAYWRIGHT_BROWSERS_PATH=$PWD/.pw-browsers npx playwright-core@1.64.1 install chromium
+process.env.PLAYWRIGHT_BROWSERS_PATH = process.env.PLAYWRIGHT_BROWSERS_PATH || require('node:path').join(__dirname, '.pw-browsers');
 const browserState = { proc: null, busy: false, lastUse: 0, launches: 0, pages: 0, lastError: null };
 const BROWSE_TIMEOUT_MS = Number(process.env.BROWSE_TIMEOUT_MS || 60000);
 const BROWSER_IDLE_MS = Number(process.env.BROWSER_IDLE_MS || 90000);
@@ -462,9 +466,7 @@ const BROWSER_IDLE_MS = Number(process.env.BROWSER_IDLE_MS || 90000);
 const browserAvailable = () => {
   try { require.resolve('playwright-core'); } catch { return false; }
   const fs = require('node:fs');
-  const os = require('node:os');
-  const path = require('node:path');
-  const roots = [process.env.PLAYWRIGHT_BROWSERS_PATH, path.join(os.homedir(), '.cache', 'ms-playwright')].filter(Boolean);
+  const roots = [process.env.PLAYWRIGHT_BROWSERS_PATH, require('node:path').join(__dirname, '.pw-browsers'), require('node:path').join(require('node:os').homedir(), '.cache', 'ms-playwright')].filter(Boolean);
   for (const r of roots) {
     try {
       if (fs.readdirSync(r).some((d) => /^chromium/.test(d))) return true;
