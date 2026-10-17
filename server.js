@@ -1041,9 +1041,11 @@ function main() {
   }
 
   // ---- WebSocket 隧道：/proxy?… ----
-  // 客户端先发一帧 TEXT = {"host":"…","port":443}，之后二进制帧双向直通 TCP。
-  // 出口是**本节点发起的连接** → 对方看到的是 Render 的共享 NAT 地址，不是你的本机。
-  // 鉴权走 header（不进请求行，所以不会落进 Render 的 HTTP 日志）。
+  // 两种模式：
+  //   ① 单流（首帧 TEXT = {"host","port"}）—— 兼容早期客户端；
+  //   ② 多路复用（首帧 TEXT = {"mux":1}）：之后每帧二进制，格式
+  //        [type(1B)][sid(4B)][payload]   type: 1=open(payload=JSON{host,port}) 2=data 3=close 4=ok/err(JSON)
+  //      **一条 WS 扛多路 TCP/UDP 流** —— 省掉每请求一次 TLS+WS 握手（实测这是主要延迟来源）。
   server.on('upgrade', (req, socket, head) => {
     const url = new URL(req.url, 'http://localhost');
     if (url.pathname !== '/proxy') return socket.destroy();
@@ -1058,12 +1060,63 @@ function main() {
     let upstream = null;
     let target = null;
     let queue = [];
+    let mux = false;
+    const streams = new Map();   // sid -> {sock, proto, host, port}
     const toClient = (payload, opcode = 2) => { try { socket.write(wsEncode(payload, opcode)); } catch { /* 已关 */ } };
+    const muxFrame = (type, sid, payload) => {
+      const b = Buffer.alloc(5 + (payload ? payload.length : 0));
+      b[0] = type;
+      b.writeUInt32BE(sid >>> 0, 1);
+      if (payload) payload.copy(b, 5);
+      toClient(b);
+    };
+    const openMuxStream = (sid, spec) => {
+      const proto = spec && spec.proto === 'udp' ? 'udp' : 'tcp';
+      const host = String(spec && spec.host);
+      const port = Number(spec && spec.port);
+      if (proto === 'udp') {
+        const dg = require('node:dgram').createSocket('udp4');
+        dg.on('message', (msg) => muxFrame(2, sid, msg));
+        dg.on('error', (e) => { muxFrame(4, sid, Buffer.from(JSON.stringify({ ok: false, error: String(e.code || e.message) }))); streams.delete(sid); try { dg.close(); } catch { /* 已关 */ } });
+        dg.bind(0, () => { streams.set(sid, { sock: dg, proto, host, port }); muxFrame(4, sid, Buffer.from(JSON.stringify({ ok: true, proto: 'udp' }))); });
+        return;
+      }
+      const s = net.connect({ host, port });
+      s.on('connect', () => { streams.set(sid, { sock: s, proto, host, port }); muxFrame(4, sid, Buffer.from(JSON.stringify({ ok: true }))); });
+      s.on('data', (d) => muxFrame(2, sid, d));
+      s.on('end', () => { muxFrame(3, sid); streams.delete(sid); });
+      s.on('error', (e) => { muxFrame(4, sid, Buffer.from(JSON.stringify({ ok: false, error: String(e.code || e.message) }))); muxFrame(3, sid); streams.delete(sid); });
+    };
+    const handleMux = (buf) => {
+      let off = 0;
+      while (off + 5 <= buf.length) {
+        const type = buf[off];
+        const sid = buf.readUInt32BE(off + 1);
+        const payload = buf.subarray(off + 5);
+        off = buf.length;                       // 目前每个 WS 帧就是一个 mux 帧
+        if (type === 1) { try { openMuxStream(sid, JSON.parse(payload.toString('utf8'))); } catch (e) { muxFrame(4, sid, Buffer.from(JSON.stringify({ ok: false, error: String(e.message) }))); } continue; }
+        const st = streams.get(sid);
+        if (type === 2) {
+          if (!st) continue;
+          if (st.proto === 'udp') st.sock.send(payload, st.port, st.host, () => {});
+          else if (st.sock.writable) st.sock.write(payload);
+          continue;
+        }
+        if (type === 3) {
+          if (!st) continue;
+          try { if (st.proto === 'udp') st.sock.close(); else st.sock.end(); } catch { /* 已关 */ }
+          streams.delete(sid);
+          continue;
+        }
+      }
+    };
     const parse = makeWsParser(
       (t) => {
+        if (mux) return;
         if (target) return;
         try {
           const j = JSON.parse(t.toString('utf8'));
+          if (j && j.mux) { mux = true; console.log('[proxy] mux 已开'); return; }
           if (!j || !j.host || !j.port) throw new Error('要 host/port');
           target = { host: String(j.host), port: Number(j.port), proto: j.proto === 'udp' ? 'udp' : 'tcp' };
           if (target.proto === 'udp') {
@@ -1104,6 +1157,7 @@ function main() {
         }
       },
       (b) => {
+        if (mux) return handleMux(b);
         if (!upstream) { queue.push(b); return; }
         if (target && target.proto === 'udp') upstream.send(b, target.port, target.host, () => {});
         else if (upstream.writable) upstream.write(b);
@@ -1114,8 +1168,12 @@ function main() {
     );
     socket.on('data', (c) => parse(c));
     if (head && head.length) parse(head);
-    // UDP 用 dgram.close()，TCP 用 destroy() —— 分开收尾
+    // UDP 用 dgram.close()，TCP 用 destroy() —— 分开收尾；mux 模式下把名下所有流一起收
     const closeUpstream = () => {
+      for (const st of streams.values()) {
+        try { if (st.proto === 'udp') st.sock.close(); else st.sock.destroy(); } catch { /* 已关 */ }
+      }
+      streams.clear();
       if (!upstream) return;
       try { if (target && target.proto === 'udp') upstream.close(); else upstream.destroy(); } catch { /* 已关 */ }
     };
