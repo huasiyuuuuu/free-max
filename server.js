@@ -880,12 +880,19 @@ function main() {
             sock.on('error', (e) => finish(e.code === 'ECONNREFUSED' ? 'refused' : 'error', { code: e.code }));
           })));
           let egress = null;
-          const echo = url.searchParams.get('echo');
-          if (echo) {
-            try {
-              const r = await fetch(echo, { signal: AbortSignal.timeout(10000) });
-              egress = { url: echo, body: (await r.text()).trim().slice(0, 160) };
-            } catch (e) { egress = { url: echo, error: String((e && e.message) || e) }; }
+          // echo 支持逗号分隔多个：用来判「出口 IP 是否随目的地变化」与「有没有 IPv6 出口」
+          const echoList = (url.searchParams.get('echo') || '').split(',').map((x) => x.trim()).filter(Boolean);
+          if (echoList.length) {
+            const list = [];
+            for (const e of echoList) {
+              try {
+                const r = await fetch(e, { signal: AbortSignal.timeout(10000) });
+                list.push({ url: e, body: (await r.text()).trim().slice(0, 160) });
+              } catch (err) { list.push({ url: e, error: String((err && err.message) || err) }); }
+            }
+            egress = list[0];
+            json(res, 200, { host, timeoutMs: timeout, egress, egressList: list, matrix });
+            return;
           }
           json(res, 200, { host, timeoutMs: timeout, egress, matrix });
         })());
