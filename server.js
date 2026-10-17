@@ -457,7 +457,21 @@ function makeWsParser(onText, onBinary, onClose, onPing) {
 const browserState = { proc: null, busy: false, lastUse: 0, launches: 0, pages: 0, lastError: null };
 const BROWSE_TIMEOUT_MS = Number(process.env.BROWSE_TIMEOUT_MS || 60000);
 const BROWSER_IDLE_MS = Number(process.env.BROWSER_IDLE_MS || 90000);
-const browserAvailable = () => { try { require.resolve('playwright-core'); return true; } catch { return false; } };
+// 「可用」判据必须是**浏览器二进制真在**，不能只看 playwright-core 能不能 require ——
+// 实测踩过：postinstall 在构建期被跳过，包在、浏览器不在，启动时才炸。
+const browserAvailable = () => {
+  try { require.resolve('playwright-core'); } catch { return false; }
+  const fs = require('node:fs');
+  const os = require('node:os');
+  const path = require('node:path');
+  const roots = [process.env.PLAYWRIGHT_BROWSERS_PATH, path.join(os.homedir(), '.cache', 'ms-playwright')].filter(Boolean);
+  for (const r of roots) {
+    try {
+      if (fs.readdirSync(r).some((d) => /^chromium/.test(d))) return true;
+    } catch { /* 目录不存在就继续找 */ }
+  }
+  return false;
+};
 
 async function browserGet() {
   if (browserState.proc) return browserState.proc;
