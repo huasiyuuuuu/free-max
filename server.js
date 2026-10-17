@@ -511,12 +511,13 @@ function browserRelease() {
 }
 
 // 导航带一次重试：首次用 domcontentloaded，失败后换 commit（弱网/重定向页常见）
-async function navigate(page, target, waitUntil) {
+async function navigate(page, target, waitUntil, timeoutMs) {
   const attempts = [];
   for (let i = 1; i <= 2; i++) {
     try {
-      const r = await page.goto(target, { timeout: BROWSE_TIMEOUT_MS, waitUntil: i === 1 ? (waitUntil || 'domcontentloaded') : 'commit' });
-      attempts.push({ attempt: i, ok: true, waitUntil: i === 1 ? (waitUntil || 'domcontentloaded') : 'commit' });
+      const tmo = i === 1 ? (timeoutMs || BROWSE_TIMEOUT_MS) : Math.min(timeoutMs || BROWSE_TIMEOUT_MS, 20000);
+      const r = await page.goto(target, { timeout: tmo, waitUntil: i === 1 ? (waitUntil || 'domcontentloaded') : 'commit' });
+      attempts.push({ attempt: i, ok: true, timeoutMs: i === 1 ? (timeoutMs || BROWSE_TIMEOUT_MS) : Math.min(timeoutMs || BROWSE_TIMEOUT_MS, 20000), waitUntil: i === 1 ? (waitUntil || 'domcontentloaded') : 'commit' });
       return { resp: r, attempts };
     } catch (e) {
       attempts.push({ attempt: i, ok: false, error: String((e && e.message) || e).slice(0, 120) });
@@ -534,7 +535,7 @@ async function browse(target, opts = {}) {
     const b = await browserGet();
     ctx = await b.newContext({ viewport: { width: 900, height: 650 }, userAgent: opts.userAgent });
     const page = await ctx.newPage();
-    const nav = await navigate(page, target, opts.waitUntil);
+    const nav = await navigate(page, target, opts.waitUntil, opts.timeoutMs);
     const resp = nav.resp;
     const title = await page.title();
     const text = String(await page.evaluate(() => (document.body ? document.body.innerText : ''))).replace(/[ \t]+\n/g, '\n').slice(0, 4000);
@@ -1012,7 +1013,10 @@ function main() {
         if (!target) return json(res, 400, { error: '要 url' });
         if (!/^https?:\/\//i.test(target)) return json(res, 400, { error: '只接受 http(s)://' });
         return guard((async () => {
+          const tmoRaw = Number(url.searchParams.get('timeout') || BROWSE_TIMEOUT_MS);
+          const timeoutMs = Math.min(60000, Math.max(3000, Number.isFinite(tmoRaw) ? tmoRaw : BROWSE_TIMEOUT_MS));
           const r = await browse(target, {
+            timeoutMs,
             shot: url.searchParams.get('shot') === '1',
             links: url.searchParams.get('links') === '1',
             waitUntil: url.searchParams.get('wait') || undefined,
