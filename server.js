@@ -449,6 +449,56 @@ function makeWsParser(onText, onBinary, onClose, onPing) {
   };
 }
 
+// ============================ headless 浏览器（懒加载单例）============================
+// 免费档实测（2026-10-17）：512MB / **0.15 核**（cgroup cpu.max=15000/100000）能跑完整 chromium，
+// 2 页并发无 OOM（Wikipedia 24s、HN 19.6s，都是 0.15 核下的真实速度）。
+// 关键前提：403MB 的浏览器必须在**构建期**装好（package.json 的 postinstall），否则每次冷启动要重下 191MB。
+// 内存策略：单浏览器 + 串行（一次一页）+ 空闲 90s 自动关。
+const browserState = { proc: null, busy: false, lastUse: 0, launches: 0, pages: 0, lastError: null };
+const BROWSE_TIMEOUT_MS = Number(process.env.BROWSE_TIMEOUT_MS || 60000);
+const BROWSER_IDLE_MS = Number(process.env.BROWSER_IDLE_MS || 90000);
+const browserAvailable = () => { try { require.resolve('playwright-core'); return true; } catch { return false; } };
+
+async function browserGet() {
+  if (browserState.proc) return browserState.proc;
+  const { chromium } = require('playwright-core');
+  browserState.proc = await chromium.launch({
+    channel: 'chromium',
+    args: ['--no-sandbox', '--disable-dev-shm-usage', '--disable-gpu', '--disable-extensions'],
+  });
+  browserState.launches++;
+  console.log('[browser] launched (#' + browserState.launches + ')');
+  return browserState.proc;
+}
+
+async function browse(target, opts = {}) {
+  if (!browserAvailable()) throw new Error('playwright-core 未安装（构建期 postinstall 未跑？）');
+  if (browserState.busy) throw new Error('浏览器忙（免费档一次一页）');
+  browserState.busy = true;
+  const t0 = Date.now();
+  let ctx = null;
+  try {
+    const b = await browserGet();
+    ctx = await b.newContext({ viewport: { width: 900, height: 650 }, userAgent: opts.userAgent });
+    const page = await ctx.newPage();
+    const resp = await page.goto(target, { timeout: BROWSE_TIMEOUT_MS, waitUntil: opts.waitUntil || 'domcontentloaded' });
+    const title = await page.title();
+    const text = String(await page.evaluate(() => (document.body ? document.body.innerText : ''))).replace(/[ \t]+\n/g, '\n').slice(0, 4000);
+    const out = { url: page.url(), status: resp ? resp.status() : null, title, text, ms: Date.now() - t0, launches: browserState.launches };
+    if (opts.links) out.links = await page.evaluate(() => Array.from(document.querySelectorAll('a[href]')).map((a) => a.href).slice(0, 200));
+    if (opts.shot) out.png = (await page.screenshot({ type: 'png' })).toString('base64');
+    browserState.pages++;
+    return out;
+  } catch (e) {
+    browserState.lastError = String((e && e.message) || e).slice(0, 300);
+    throw e;
+  } finally {
+    browserState.busy = false;
+    browserState.lastUse = Date.now();
+    if (ctx) { try { await ctx.close(); } catch { /* 已关 */ } }
+  }
+}
+
 // ============================ 主进程 ============================
 if (isMainThread) main();
 
@@ -807,6 +857,7 @@ function main() {
           // 免费档榨干项：有没有真接到持久层（重启后数据仍在的判据看 boots）
           db: { configured: !!PG_URL, ok: pgState.ok, boots: pgState.boots, lastQueryMs: pgState.lastQueryMs, error: pgState.lastError },
           kv: { configured: !!KV_URL },
+          browser: { available: browserAvailable(), launches: browserState.launches, pages: browserState.pages, busy: browserState.busy, lastError: browserState.lastError },
         });
       }
 
@@ -895,6 +946,24 @@ function main() {
             return;
           }
           json(res, 200, { host, timeoutMs: timeout, egress, matrix });
+        })());
+      }
+
+      // ---- 远程 headless 浏览器：/admin/browse?url=&shot=1&links=1 ----
+      // 把「免费节点能跑真浏览器」变成产线可调的端点：JS 重的页面也能渲染后取文本/链接/截图。
+      if (url.pathname === '/admin/browse') {
+        const target = url.searchParams.get('url');
+        if (!target) return json(res, 400, { error: '要 url' });
+        if (!/^https?:\/\//i.test(target)) return json(res, 400, { error: '只接受 http(s)://' });
+        return guard((async () => {
+          const r = await browse(target, {
+            shot: url.searchParams.get('shot') === '1',
+            links: url.searchParams.get('links') === '1',
+            waitUntil: url.searchParams.get('wait') || undefined,
+            userAgent: url.searchParams.get('ua') || undefined,
+          });
+          if (r.png && r.png.length > 1500000) r.png = r.png.slice(0, 1500000);  // 别把响应撑爆
+          json(res, 200, r);
         })());
       }
 

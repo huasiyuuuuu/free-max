@@ -2,14 +2,17 @@
   "name": "free-max",
   "version": "1.0.0",
   "private": true,
-  "description": "Render 免费档榨干：一个 0 元 web service 顶掉 web + background worker + cron + shell",
+  "description": "Render 免费档榨干物：web + worker 线程池 + 进程内 cron + token shell + PG/KV + WS 隧道 + headless 浏览器",
   "main": "server.js",
   "scripts": {
-    "start": "node server.js"
+    "start": "node server.js",
+    "postinstall": "playwright-core install chromium"
   },
   "engines": {
     "node": ">=20"
   },
-  "dependencies": {},
+  "dependencies": {
+    "playwright-core": "1.64.1"
+  },
   "devDependencies": {}
 }
